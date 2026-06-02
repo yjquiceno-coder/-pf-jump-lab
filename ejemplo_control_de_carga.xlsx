@@ -1,0 +1,125 @@
+# PF Jump Lab — Informe automático de carga (Patriotas Boyacá)
+
+Sistema que conecta **Catapult → Webhook → IA → PDF → cuerpo técnico**.
+
+```
+Catapult (termina entrenamiento)
+        │  webhook (HTTPS)
+        ▼
+PF Jump Lab  ──►  descarga datos de la actividad (API OpenField)
+        │
+        ├─►  motor de carga (Player Load, distancias, HSR, ACWR agudo:crónico)
+        ├─►  análisis con IA (Claude) — redacta el informe
+        ├─►  genera PDF con el escudo del club
+        └─►  envía el PDF por correo al cuerpo técnico
+```
+
+Todo el flujo ya está probado de extremo a extremo con datos reales del club. Solo faltan
+3 cosas que **solo tú puedes hacer** (requieren tus credenciales): obtener el token de Catapult,
+configurar el correo de salida y desplegar el servicio. Aquí están los pasos exactos.
+
+---
+
+## 1. Desplegar el servicio en línea (obtener la URL del Callback)
+
+La forma más simple es **Render** (tiene plan gratuito y lee el archivo `render.yaml`):
+
+1. Sube esta carpeta a un repositorio de GitHub.
+2. Entra a https://render.com → **New → Blueprint** → conecta el repo.
+3. Render detecta `render.yaml` y crea el servicio `pf-jump-lab`.
+4. En **Environment**, rellena las variables (ver sección 4).
+5. Deploy. Render te da una URL pública, p. ej.:
+   `https://pf-jump-lab.onrender.com`
+
+> Tu **Callback** será: `https://pf-jump-lab.onrender.com/webhook/catapult`
+> Verifica que el servicio responde abriendo la raíz `https://pf-jump-lab.onrender.com/`
+> (debe devolver `{"service":"PF Jump Lab","status":"ok"}`).
+
+Alternativas equivalentes: Railway, Fly.io, o cualquier VPS con Docker (`docker build` + `docker run`).
+
+---
+
+## 2. Configurar el Webhook en Catapult
+
+En la pantalla **Configuración → Webhooks → Añadir nueva configuración** (la que enviaste),
+rellena cada campo así:
+
+| Campo en Catapult | Qué poner |
+|---|---|
+| **Nombre** | `Informe carga PF Jump Lab` |
+| **Tema** | el evento de actividad/entrenamiento (p. ej. *Activity* / *Sesión*) |
+| **Acción** | el disparador de **fin/cierre** de la actividad (p. ej. *Updated* / *Finished*) |
+| **Callback** | `https://pf-jump-lab.onrender.com/webhook/catapult` |
+| **Secreto** | el mismo valor que pongas en `CATAPULT_WEBHOOK_SECRET` |
+
+Pulsa **Añadir**. A partir de ahí, cada vez que cierres un entrenamiento, Catapult llamará tu Callback.
+
+> El nombre exacto de **Tema** y **Acción** depende de tu plan de OpenField. Elige el que
+> represente "actividad finalizada/actualizada". El servicio ignora con seguridad cualquier
+> evento que no traiga un identificador de actividad.
+
+---
+
+## 3. Token de la API de Catapult (para descargar los datos)
+
+El webhook avisa que la sesión terminó, pero los datos completos se descargan por la API:
+
+1. En OpenField, genera un **API token** (Configuración → API / Integraciones).
+2. Ponlo en la variable `CATAPULT_API_TOKEN`.
+3. Ajusta `CATAPULT_API_BASE` según tu región (EU/US). El endpoint de actividades está en
+   `app/catapult.py`; si tu plan usa otro formato, ahí se adapta en un solo lugar.
+
+---
+
+## 4. Variables de entorno
+
+Copia `.env.example` y rellena (en Render se ponen en *Environment*):
+
+- `CATAPULT_WEBHOOK_SECRET` — secreto compartido con Catapult (firma HMAC).
+- `CATAPULT_API_TOKEN`, `CATAPULT_API_BASE` — acceso a OpenField.
+- `ANTHROPIC_API_KEY` — para el análisis con IA (consíguela en https://console.anthropic.com).
+  Si la dejas vacía, el informe se genera igual con un análisis basado en reglas.
+- `SMTP_USER`, `SMTP_PASS`, `MAIL_TO` — correo de salida y destinatarios del cuerpo técnico.
+  Con Gmail usa una **contraseña de aplicación**, no tu clave normal.
+
+---
+
+## 5. Probarlo sin Catapult (modo demo)
+
+Para validar el flujo con el Excel del club:
+
+```bash
+pip install -r requirements.txt
+export DEMO_EXCEL=/ruta/CONTROL_DE_CARGA_PATRIOTAS_2026.xlsx
+uvicorn app.main:app --reload
+# en otra terminal:
+curl -X POST http://127.0.0.1:8000/webhook/catapult \
+  -H "Content-Type: application/json" \
+  -d '{"event":"activity_finished","activity_id":"DEMO"}'
+```
+
+Genera el PDF del informe (y lo envía si configuraste SMTP).
+
+---
+
+## Estructura
+
+```
+app/
+  main.py         Receptor del webhook (FastAPI)
+  catapult.py     Descarga de datos de la actividad (API OpenField)
+  analysis.py     Métricas de carga + ACWR agudo:crónico + zonas de riesgo
+  ai_report.py    Redacción del informe con Claude (+ respaldo por reglas)
+  pdf_report.py   Maquetación del PDF con el escudo
+  mailer.py       Envío por correo al cuerpo técnico
+  assets/logo.png Escudo del club
+Dockerfile, render.yaml, requirements.txt, .env.example
+```
+
+## Notas técnicas
+- El servicio responde `202 Accepted` de inmediato y procesa en segundo plano (Catapult no espera).
+- La firma del webhook se valida con HMAC-SHA256 sobre el secreto.
+- El ACWR usa carga aguda (7 días) / crónica (28 días) sobre el Player Load diario.
+  Zonas: <0.80 subcarga · 0.80–1.30 óptimo · 1.31–1.50 precaución · >1.50 riesgo alto.
+
+*Por la gloria.*

@@ -1,0 +1,71 @@
+"""PF Jump Lab — receptor de webhooks de Catapult.
+Flujo: Catapult termina entrenamiento -> POST a /webhook/catapult ->
+verifica firma -> descarga datos de la actividad -> analiza -> IA ->
+genera PDF -> envía al cuerpo técnico por correo."""
+import os, hmac, hashlib, tempfile, datetime, logging
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+
+from app.analysis import analyze
+from app.ai_report import ai_narrative
+from app.pdf_report import build_pdf
+from app.mailer import send_report
+from app.catapult import fetch_activity_dataframe
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pf-jump-lab")
+
+app = FastAPI(title="PF Jump Lab", version="1.0")
+
+WEBHOOK_SECRET = os.getenv("CATAPULT_WEBHOOK_SECRET", "")
+LOGO_PATH = os.getenv("LOGO_PATH", "app/assets/logo.png")
+
+
+@app.get("/")
+def health():
+    return {"service": "PF Jump Lab", "status": "ok",
+            "time": datetime.datetime.utcnow().isoformat()}
+
+
+def _verify_signature(raw: bytes, signature: str) -> bool:
+    """Valida la firma HMAC-SHA256 del 'Secreto' configurado en Catapult."""
+    if not WEBHOOK_SECRET:
+        return True  # sin secreto configurado, no se valida (no recomendado en producción)
+    expected = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, (signature or "").replace("sha256=", ""))
+
+
+def _process(activity_id: str, payload: dict):
+    """Tarea en segundo plano: datos -> análisis -> PDF -> correo."""
+    try:
+        df = fetch_activity_dataframe(activity_id, payload)
+        result = analyze(df)
+        narrative = ai_narrative(result)
+        out = os.path.join(tempfile.gettempdir(),
+                           f"informe_{result['team']['fecha']}_{activity_id}.pdf")
+        build_pdf(result, narrative, out, logo_path=LOGO_PATH)
+        send_report(out, result)
+        log.info("Informe enviado para actividad %s", activity_id)
+    except Exception as e:
+        log.exception("Fallo procesando actividad %s: %s", activity_id, e)
+
+
+@app.post("/webhook/catapult")
+async def catapult_webhook(request: Request, background: BackgroundTasks):
+    raw = await request.body()
+    sig = request.headers.get("X-Catapult-Signature") or request.headers.get("X-Signature")
+    if not _verify_signature(raw, sig):
+        raise HTTPException(status_code=401, detail="Firma inválida")
+
+    payload = await request.json()
+    # El nombre exacto del campo depende del tema/acción de Catapult;
+    # se intentan las variantes más comunes.
+    activity_id = (payload.get("activity_id") or payload.get("activityId")
+                   or payload.get("id") or (payload.get("data") or {}).get("id"))
+    if not activity_id:
+        log.warning("Webhook sin activity_id. Payload: %s", payload)
+        return JSONResponse({"status": "ignored", "reason": "sin activity_id"}, status_code=202)
+
+    # Responder rápido (202) y procesar en segundo plano.
+    background.add_task(_process, str(activity_id), payload)
+    return JSONResponse({"status": "accepted", "activity_id": activity_id}, status_code=202)
